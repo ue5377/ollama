@@ -63,6 +63,10 @@ type Converter interface {
 	writeFile(io.WriteSeeker, llm.KV, []*llm.Tensor) error
 }
 
+type moreParser interface {
+	parseMore(string) error
+}
+
 func Convert(d string, ws io.WriteSeeker) error {
 	f, err := os.Open(filepath.Join(d, "config.json"))
 	if err != nil {
@@ -89,6 +93,8 @@ func Convert(d string, ws io.WriteSeeker) error {
 		c = &gemma{}
 	case "Phi3ForCausalLM":
 		c = &phi3{}
+	case "BertModel":
+		c = &bert{}
 	default:
 		return errors.New("unsupported architecture")
 	}
@@ -100,6 +106,12 @@ func Convert(d string, ws io.WriteSeeker) error {
 
 	if err := json.Unmarshal(bts, c); err != nil {
 		return err
+	}
+
+	if t, ok := c.(moreParser); ok {
+		if err := t.parseMore(d); err != nil {
+			return err
+		}
 	}
 
 	t, err := parseTokenizer(d, c.specialTypes())

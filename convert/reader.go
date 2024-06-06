@@ -32,6 +32,8 @@ func (t tensorBase) Shape() []uint64 {
 func (t tensorBase) Kind() uint32 {
 	if strings.HasSuffix(t.name, ".block_sparse_moe.gate.weight") {
 		return 0
+	} else if t.name == "embeddings.token_type_embeddings.weight" {
+		return 0
 	}
 
 	switch len(t.shape) {
