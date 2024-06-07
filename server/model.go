@@ -94,8 +94,13 @@ func parseFromZipFile(_ context.Context, file *os.File, digest string, fn func(a
 
 	fn(api.ProgressResponse{Status: "unpacking model metadata"})
 	for _, f := range r.File {
+		p := filepath.Join(tempdir, f.Name)
+		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+			return nil, err
+		}
+
 		// TODO(mxyng): this should not write out all files to disk
-		outfile, err := os.Create(filepath.Join(tempdir, f.Name))
+		outfile, err := os.Create(p)
 		if err != nil {
 			return nil, err
 		}
