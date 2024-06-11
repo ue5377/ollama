@@ -34,6 +34,15 @@ import (
 	"github.com/ollama/ollama/version"
 )
 
+type Capability int
+
+const (
+	_ Capability = iota
+	CapCompletion
+
+	CapUnknown
+)
+
 type registryOptions struct {
 	Insecure bool
 	Username string
@@ -58,8 +67,20 @@ type Model struct {
 	Template *template.Template
 }
 
-func (m *Model) IsEmbedding() bool {
-	return slices.Contains(m.Config.ModelFamilies, "bert") || slices.Contains(m.Config.ModelFamilies, "nomic-bert")
+func (m *Model) Can(caps ...Capability) bool {
+	for _, cap := range caps {
+		switch cap {
+		case CapCompletion:
+			if slices.Contains(m.Config.ModelFamilies, "bert") || slices.Contains(m.Config.ModelFamilies, "nomic-bert") {
+				return false
+			}
+		default:
+			slog.Error("unknown capability", "capability", cap)
+			return false
+		}
+	}
+
+	return true
 }
 
 func (m *Model) String() string {
