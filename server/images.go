@@ -71,7 +71,21 @@ func (m *Model) Can(caps ...Capability) bool {
 	for _, cap := range caps {
 		switch cap {
 		case CapCompletion:
-			if slices.Contains(m.Config.ModelFamilies, "bert") || slices.Contains(m.Config.ModelFamilies, "nomic-bert") {
+			f, err := os.Open(m.ModelPath)
+			if err != nil {
+				slog.Error("couldn't open model file", "error", err)
+				continue
+			}
+			defer f.Close()
+
+			// TODO(mxyng): decode the GGML into model to avoid doing this multiple times
+			ggml, _, err := llm.DecodeGGML(f)
+			if err != nil {
+				slog.Error("couldn't decode ggml", "error", err)
+				continue
+			}
+
+			if _, ok := ggml.KV()[fmt.Sprintf("%s.pooling_type", ggml.KV().Architecture())]; ok {
 				return false
 			}
 		default:
