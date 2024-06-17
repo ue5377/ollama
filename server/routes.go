@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -71,174 +72,141 @@ func modelOptions(model *Model, requestOpts map[string]interface{}) (api.Options
 	return opts, nil
 }
 
-func isSupportedImageType(image []byte) bool {
-	contentType := http.DetectContentType(image)
-	allowedTypes := []string{"image/jpeg", "image/jpg", "image/png"}
-	return slices.Contains(allowedTypes, contentType)
+func (s *Server) scheduleCompletion(ctx context.Context, name string, requestOpts map[string]any, keepAlive *api.Duration) (*runnerRef, error) {
+	if name == "" {
+		return nil, errors.New("model is required")
+	}
+
+	model, err := GetModel(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if !model.Can(CapCompletion) {
+		return nil, errors.New("model does not support completion")
+	}
+
+	opts, err := modelOptions(model, requestOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionDuration := getDefaultSessionDuration()
+	if keepAlive != nil {
+		sessionDuration = keepAlive.Duration
+	}
+
+	runnerCh, errCh := s.sched.GetRunner(ctx, model, opts, sessionDuration)
+	var runner *runnerRef
+	select {
+	case runner = <-runnerCh:
+	case err = <-errCh:
+		return nil, err
+	}
+
+	return runner, nil
 }
 
 func (s *Server) GenerateHandler(c *gin.Context) {
-	checkpointStart := time.Now()
 	var req api.GenerateRequest
-	err := c.ShouldBindJSON(&req)
-
-	switch {
-	case errors.Is(err, io.EOF):
+	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
 		return
-	case err != nil:
+	} else if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// validate the request
-	switch {
-	case req.Model == "":
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+	if req.Format != "" && req.Format != "json" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "format must be empty or \"json\""})
 		return
-	case len(req.Format) > 0 && req.Format != "json":
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "format must be json"})
-		return
-	case req.Raw && (req.Template != "" || req.System != "" || len(req.Context) > 0):
+	} else if req.Raw && (req.Template != "" || req.System != "" || len(req.Context) > 0) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "raw mode does not support template, system, or context"})
 		return
 	}
 
-	for _, img := range req.Images {
-		if !isSupportedImageType(img) {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "unsupported image format"})
+	r, err := s.scheduleCompletion(c.Request.Context(), req.Model, req.Options, req.KeepAlive)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	images := make([]llm.ImageData, len(req.Images))
+	for i := range req.Images {
+		images[i] = llm.ImageData{ID: i, Data: req.Images[i]}
+	}
+
+	prompt := req.Prompt
+	if !req.Raw {
+		var msgs []api.Message
+		if req.System != "" {
+			msgs = append(msgs, api.Message{Role: "system", Content: req.System})
+		} else if r.model.System != "" {
+			msgs = append(msgs, api.Message{Role: "system", Content: r.model.System})
+		}
+
+		if req.Prompt != "" {
+			for _, i := range images {
+				msgs = append(msgs, api.Message{Role: "user", Content: fmt.Sprintf("[img-%d]", i.ID)})
+			}
+
+			msgs = append(msgs, api.Message{Role: "user", Content: req.Prompt})
+		}
+
+		if len(msgs) == 0 {
+			c.JSON(http.StatusOK, api.GenerateResponse{
+				Model:      req.Model,
+				CreatedAt:  time.Now().UTC(),
+				Done:       true,
+				DoneReason: "load",
+			})
 			return
 		}
-	}
 
-	model, err := GetModel(req.Model)
-	if err != nil {
-		var pErr *fs.PathError
-		if errors.As(err, &pErr) {
-			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found, try pulling it first", req.Model)})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	if !model.Can(CapCompletion) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "model does not support completion"})
-		return
-	}
-
-	opts, err := modelOptions(model, req.Options)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	var sessionDuration time.Duration
-	if req.KeepAlive == nil {
-		sessionDuration = getDefaultSessionDuration()
-	} else {
-		sessionDuration = req.KeepAlive.Duration
-	}
-
-	rCh, eCh := s.sched.GetRunner(c.Request.Context(), model, opts, sessionDuration)
-	var runner *runnerRef
-	select {
-	case runner = <-rCh:
-	case err = <-eCh:
-		handleErrorResponse(c, err)
-		return
-	}
-
-	// an empty request loads the model
-	// note: for a short while template was used in lieu
-	// of `raw` mode so we need to check for it too
-	if req.Prompt == "" && req.Template == "" && req.System == "" {
-		c.JSON(http.StatusOK, api.GenerateResponse{
-			CreatedAt:  time.Now().UTC(),
-			Model:      req.Model,
-			Done:       true,
-			DoneReason: "load",
-		})
-		return
-	}
-
-	tmpl, err := template.Parse(req.Template)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	checkpointLoaded := time.Now()
-
-	var prompt string
-	switch {
-	case req.Raw:
-		prompt = req.Prompt
-	case req.Prompt != "":
-		if req.Template == "" {
-			model.Template, err = template.Parse(req.Template)
+		tmpl := r.model.Template
+		if req.Template != "" {
+			tmpl, err = template.Parse(req.Template)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 		}
 
-		if req.System == "" {
-			req.System = model.System
+		var b bytes.Buffer
+		if req.Context != nil {
+			s, err := r.llama.Detokenize(c.Request.Context(), req.Context)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			b.WriteString(s)
 		}
 
-		slog.Debug("generate handler", "prompt", req.Prompt)
-		slog.Debug("generate handler", "template", req.Template)
-		slog.Debug("generate handler", "system", req.System)
-
-		var sb strings.Builder
-		for i := range req.Images {
-			fmt.Fprintf(&sb, "[img-%d] ", i)
-		}
-
-		sb.WriteString(req.Prompt)
-
-		p, err := Prompt(tmpl, req.System, sb.String(), "", true)
-		if err != nil {
+		if err := tmpl.Execute(&b, template.Values{Messages: msgs}); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
-		sb.Reset()
-		if req.Context != nil {
-			prev, err := runner.llama.Detokenize(c.Request.Context(), req.Context)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-
-			sb.WriteString(prev)
-		}
-
-		sb.WriteString(p)
-
-		prompt = sb.String()
+		prompt = b.String()
 	}
 
-	slog.Debug("generate handler", "prompt", prompt)
+	slog.Debug("generate request", "prompt", prompt, "images", images)
 
 	ch := make(chan any)
-	var generated strings.Builder
 	go func() {
 		defer close(ch)
-
-		fn := func(r llm.CompletionResponse) {
-			// Build up the full response
-			if _, err := generated.WriteString(r.Content); err != nil {
-				ch <- gin.H{"error": err.Error()}
-				return
-			}
-
-			resp := api.GenerateResponse{
+		if err := r.llama.Completion(c.Request.Context(), llm.CompletionRequest{
+			Prompt:  prompt,
+			Images:  images,
+			Format:  req.Format,
+			Options: *r.Options,
+		}, func(r llm.CompletionResponse) {
+			ch <- api.GenerateResponse{
 				Model:      req.Model,
 				CreatedAt:  time.Now().UTC(),
-				Done:       r.Done,
 				Response:   r.Content,
+				Done:       r.Done,
 				DoneReason: r.DoneReason,
 				Metrics: api.Metrics{
 					PromptEvalCount:    r.PromptEvalCount,
@@ -247,77 +215,35 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					EvalDuration:       r.EvalDuration,
 				},
 			}
-
-			if r.Done {
-				resp.TotalDuration = time.Since(checkpointStart)
-				resp.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-
-				if !req.Raw {
-					p, err := Prompt(tmpl, req.System, req.Prompt, generated.String(), false)
-					if err != nil {
-						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-						return
-					}
-
-					// TODO (jmorganca): encode() should not strip special tokens
-					tokens, err := runner.llama.Tokenize(c.Request.Context(), p)
-					if err != nil {
-						ch <- gin.H{"error": err.Error()}
-						return
-					}
-
-					resp.Context = append(req.Context, tokens...)
-				}
-			}
-
-			ch <- resp
-		}
-
-		var images []llm.ImageData
-		for i := range req.Images {
-			images = append(images, llm.ImageData{
-				ID:   i,
-				Data: req.Images[i],
-			})
-		}
-
-		// Start prediction
-		req := llm.CompletionRequest{
-			Prompt:  prompt,
-			Format:  req.Format,
-			Images:  images,
-			Options: opts,
-		}
-		if err := runner.llama.Completion(c.Request.Context(), req, fn); err != nil {
+		}); err != nil {
 			ch <- gin.H{"error": err.Error()}
 		}
 	}()
 
 	if req.Stream != nil && !*req.Stream {
-		// Accumulate responses into the final response
-		var final api.GenerateResponse
+		var r api.GenerateResponse
 		var sb strings.Builder
-		for resp := range ch {
-			switch r := resp.(type) {
+		for rr := range ch {
+			switch t := rr.(type) {
 			case api.GenerateResponse:
-				sb.WriteString(r.Response)
-				final = r
+				sb.WriteString(t.Response)
+				r = t
 			case gin.H:
-				if errorMsg, ok := r["error"].(string); ok {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": errorMsg})
-					return
-				} else {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error format in response"})
-					return
+				msg, ok := t["error"].(string)
+				if !ok {
+					msg = "unexpected error format in response"
 				}
+
+				c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
+				return
 			default:
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
 		}
 
-		final.Response = sb.String()
-		c.JSON(http.StatusOK, final)
+		r.Response = sb.String()
+		c.JSON(http.StatusOK, r)
 		return
 	}
 
@@ -697,9 +623,9 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 		}
 	}
 
-	msgs := make([]api.Message, 0)
-	for _, msg := range m.Messages {
-		msgs = append(msgs, api.Message{Role: msg.Role, Content: msg.Content})
+	msgs := make([]api.Message, len(m.Messages))
+	for i, msg := range m.Messages {
+		msgs[i] = api.Message{Role: msg.Role, Content: msg.Content}
 	}
 
 	n := model.ParseName(req.Model)
@@ -1206,139 +1132,51 @@ func (s *Server) ProcessHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
 }
 
-// ChatPrompt builds up a prompt from a series of messages for the currently `loaded` model
-func chatPrompt(ctx context.Context, runner *runnerRef, template *template.Template, messages []api.Message, numCtx int) (string, error) {
-	encode := func(s string) ([]int, error) {
-		return runner.llama.Tokenize(ctx, s)
-	}
-
-	prompt, err := ChatPrompt(template, messages, numCtx, encode)
-	if err != nil {
-		return "", err
-	}
-
-	return prompt, nil
-}
-
 func (s *Server) ChatHandler(c *gin.Context) {
-	checkpointStart := time.Now()
-
 	var req api.ChatRequest
-	err := c.ShouldBindJSON(&req)
-	switch {
-	case errors.Is(err, io.EOF):
+	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
 		return
-	case err != nil:
+	} else if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// validate the request
-	switch {
-	case req.Model == "":
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
-		return
-	case len(req.Format) > 0 && req.Format != "json":
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "format must be json"})
-		return
-	}
-
-	model, err := GetModel(req.Model)
-	if err != nil {
-		var pErr *fs.PathError
-		if errors.As(err, &pErr) {
-			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found, try pulling it first", req.Model)})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	if !model.Can(CapCompletion) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "model does not support chat completion"})
-		return
-	}
-
-	opts, err := modelOptions(model, req.Options)
+	r, err := s.scheduleCompletion(c.Request.Context(), req.Model, req.Options, req.KeepAlive)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	var sessionDuration time.Duration
-	if req.KeepAlive == nil {
-		sessionDuration = getDefaultSessionDuration()
-	} else {
-		sessionDuration = req.KeepAlive.Duration
-	}
-
-	rCh, eCh := s.sched.GetRunner(c.Request.Context(), model, opts, sessionDuration)
-	var runner *runnerRef
-	select {
-	case runner = <-rCh:
-	case err = <-eCh:
-		handleErrorResponse(c, err)
-		return
-	}
-
-	checkpointLoaded := time.Now()
-
-	// if the first message is not a system message, then add the model's default system message
-	if len(req.Messages) > 0 && req.Messages[0].Role != "system" {
-		req.Messages = append([]api.Message{
-			{
-				Role:    "system",
-				Content: model.System,
-			},
-		}, req.Messages...)
-	}
-
-	prompt, err := chatPrompt(c.Request.Context(), runner, model.Template, req.Messages, opts.NumCtx)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// an empty request loads the model
-	if len(req.Messages) == 0 || prompt == "" {
-		resp := api.ChatResponse{
-			CreatedAt:  time.Now().UTC(),
+	if len(req.Messages) == 0 {
+		c.JSON(http.StatusOK, api.ChatResponse{
 			Model:      req.Model,
+			CreatedAt:  time.Now().UTC(),
+			Message:    api.Message{Role: "assistant"},
 			Done:       true,
 			DoneReason: "load",
-			Message:    api.Message{Role: "assistant"},
-		}
-		c.JSON(http.StatusOK, resp)
+		})
 		return
 	}
 
-	// only send images that are in the prompt
-	var i int
-	var images []llm.ImageData
-	for _, m := range req.Messages {
-		for _, img := range m.Images {
-			if !isSupportedImageType(img) {
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "unsupported image format"})
-				return
-			}
-
-			if strings.Contains(prompt, fmt.Sprintf("[img-%d]", i)) {
-				images = append(images, llm.ImageData{Data: img, ID: i})
-			}
-			i += 1
-		}
+	prompt, images, err := chatPrompt(c.Request.Context(), r, req.Messages)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
-	slog.Debug("chat handler", "prompt", prompt, "images", len(images))
+	slog.Debug("chat request", "images", len(images), "prompt", prompt)
 
 	ch := make(chan any)
-
 	go func() {
 		defer close(ch)
-
-		fn := func(r llm.CompletionResponse) {
-			resp := api.ChatResponse{
+		if err := r.llama.Completion(c.Request.Context(), llm.CompletionRequest{
+			Prompt:  prompt,
+			Images:  images,
+			Format:  req.Format,
+			Options: *r.Options,
+		}, func(r llm.CompletionResponse) {
+			ch <- api.ChatResponse{
 				Model:      req.Model,
 				CreatedAt:  time.Now().UTC(),
 				Message:    api.Message{Role: "assistant", Content: r.Content},
@@ -1351,50 +1189,35 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					EvalDuration:       r.EvalDuration,
 				},
 			}
-
-			if r.Done {
-				resp.TotalDuration = time.Since(checkpointStart)
-				resp.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-			}
-
-			ch <- resp
-		}
-
-		if err := runner.llama.Completion(c.Request.Context(), llm.CompletionRequest{
-			Prompt:  prompt,
-			Format:  req.Format,
-			Images:  images,
-			Options: opts,
-		}, fn); err != nil {
+		}); err != nil {
 			ch <- gin.H{"error": err.Error()}
 		}
 	}()
 
 	if req.Stream != nil && !*req.Stream {
-		// Accumulate responses into the final response
-		var final api.ChatResponse
+		var r api.ChatResponse
 		var sb strings.Builder
-		for resp := range ch {
-			switch r := resp.(type) {
+		for rr := range ch {
+			switch t := rr.(type) {
 			case api.ChatResponse:
-				sb.WriteString(r.Message.Content)
-				final = r
+				sb.WriteString(t.Message.Content)
+				r = t
 			case gin.H:
-				if errorMsg, ok := r["error"].(string); ok {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": errorMsg})
-					return
-				} else {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error format in response"})
-					return
+				msg, ok := t["error"].(string)
+				if !ok {
+					msg = "unexpected error format in response"
 				}
+
+				c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
+				return
 			default:
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
 		}
 
-		final.Message = api.Message{Role: "assistant", Content: sb.String()}
-		c.JSON(http.StatusOK, final)
+		r.Message.Content = sb.String()
+		c.JSON(http.StatusOK, r)
 		return
 	}
 

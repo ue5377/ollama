@@ -55,8 +55,7 @@ func loadModel(cmd *cobra.Command, opts *runOptions) error {
 	}
 
 	chatReq := &api.ChatRequest{
-		Model:    opts.Model,
-		Messages: []api.Message{},
+		Model: opts.Model,
 	}
 
 	if opts.KeepAlive != nil {
@@ -88,8 +87,6 @@ func loadModel(cmd *cobra.Command, opts *runOptions) error {
 }
 
 func generateInteractive(cmd *cobra.Command, opts runOptions) error {
-	opts.Messages = make([]api.Message, 0)
-
 	err := loadModel(cmd, &opts)
 	if err != nil {
 		return err
